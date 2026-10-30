@@ -1,0 +1,437 @@
+---
+title: "PNMI_VTA_R_Markdown"
+output: html_document
+date: "2025-06-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+
+#import packages
+if (!require("pacman")) install.packages("pacman")
+library(pacman)
+pacman::p_load("rio", "tidyverse", "tidyr", "dplyr", "ggstatsplot", "GGally", "purrr", "Hmisc", "corrplot", "DescTools", "lmSupport", "lm.beta", "lubridate", "pastecs")
+
+df <- read.csv("/Volumes/psychology/Ellman_Group/ranesh/Neuro_Projects/HBP/Final Materials/Stats Files/HBP_behavior_pnmi_tractography.csv")
+```
+
+
+## Demographic Data
+
+```{r, message=FALSE, warning=FALSE}
+#remove old incorrect mom_education
+df$mom_education <- NULL
+
+#rename sex, birth date variables
+df <- df %>%
+rename(c(mom_education = GRAVEDUC))
+
+df <- rename(df, sex = SD2)
+
+# calculate age from start date and birth date
+df <- df %>% 
+  mutate(
+    StartDate = ymd_hms(StartDate),
+    StartDateOnly = as_date(StartDate),
+    dob_raw = mdy(SD1),
+    dob = if_else(dob_raw > StartDateOnly,
+                  dob_raw - years(100), dob_raw),
+    age_days = as.numeric(StartDateOnly - dob, units = "days"),
+    age_years = age_days/365.25
+  )
+
+# recode maternal education variable
+df$mom_education <- recode(df$mom_education, '0'=0, '1'=0, '2'=1, '3'=2, '4'=2, '5'=2, '6'=2, '7'=0)
+library(dplyr)
+
+df$mom_education <- na_if(df$mom_education, 9)
+
+# set mat_ed and sex variables as factor variables
+df$mom_education <- as.factor(df$mom_education)
+df$sex <- as.factor(df$sex)
+
+#log transform macrostructure count
+df$l_vta_hipp_count.log <- log(df$l_vta_hipp_count)
+df$r_vta_hipp_count.log <- log(df$r_vta_hipp_count)
+df$l_vta_limbic_count.log <- log(df$l_vta_limbic_count)
+df$r_vta_limbic_count.log <- log(df$r_vta_limbic_count)
+```
+
+#Run a correlation matrix for the variables of interest
+
+```{r, message=FALSE, warning=FALSE}
+#Make numeric versions of variables for the correlation table
+df$sex_num <- as.numeric(as.factor(df$sex))
+df$hand_num <- as.numeric(as.factor(df$hand))
+df$mom_education_num <- as.numeric(as.factor(df$mom_education))
+
+
+write.csv(df, "/Users/tur31625/Desktop/jasp_correlation.csv", row.names = FALSE)
+
+library(Hmisc)
+
+#Trimester 1
+vars <- c("mom_education_num", "age_years", "hand_num", "sex_num", "ICV", "IL1RA_1", "IL6_1", "IL8_1", "STNFRII_1", "l_vta_hipp_count.log", "r_vta_hipp_count.log", "l_vta_limbic_count.log", "r_vta_limbic_count.log")
+df_sub <- df[ , vars]
+T1_corr <- rcorr(as.matrix(df_sub), type = "spearman")
+print(T1_corr$r)
+print(T1_corr$P)
+
+
+#Trimester 2
+vars <- c("mom_education_num", "age_years", "hand_num", "sex_num", "ICV", "IL1RA_2", "IL6_2", "IL8_2", "STNFRII_2", "l_vta_hipp_count.log", "r_vta_hipp_count.log", "l_vta_limbic_count.log", "r_vta_limbic_count.log")
+df_sub <- df[ , vars]
+T2_corr <- rcorr(as.matrix(df_sub), type = "spearman")
+print(T2_corr$r)
+print(T2_corr$P)
+
+#neither tables had age or handedness significantly correlated with any variables of interest, so we could leave them out of our models.
+
+library(haven)
+df <- df[ , !names(df) %in% c("Hand")]
+
+
+```
+# Hierarchical Regression Analyses
+#Hierarchical regression models were implemented for each cytokine and region-of-interest separately for each trimester (i.e., one cytokine was included in each model).
+
+```{r, message=FALSE, warning=FALSE}
+
+#create a function for the hierarchical linear regressions
+
+hr <- function(data, outcome, predictor, covar) {
+  # Combine variables needed
+  vars <- c(outcome, covar, predictor)
+  # Remove rows with missing data
+  df_clean <- na.omit(data[, vars])
+  # Create formulas
+  base_formula <- as.formula(paste(outcome, "~", paste(covar, collapse = " + ")))
+  full_formula <- as.formula(paste(outcome, "~", paste(c(covar, predictor), collapse = " + ")))
+  # Fit models
+  model1 <- lm(base_formula, data = df_clean)
+  model2 <- lm(full_formula, data = df_clean)
+  #Bootstrap, 5000 iterations
+  set.seed(123)
+  n_iter <- 5000
+  results <- data.frame(r2_diff = numeric(n_iter),
+                        adjr2_diff = numeric(n_iter),
+                        coef_pred = numeric(n_iter))
+  
+  for (i in 1:n_iter) {
+    boot_indices <- sample(nrow(df_clean), replace = TRUE)
+    boot_data <- df_clean[boot_indices, ]
+    base_boot <- lm(base_formula, data = boot_data)
+    full_boot <- lm(full_formula, data = boot_data)
+    results$r2_diff[i] <- summary(full_boot)$r.squared - summary(base_boot)$r.squared
+    results$adjr2_diff[i] <- summary(full_boot)$adj.r.squared - summary(base_boot)$adj.r.squared
+    results$coef_pred[i] <- coef(full_boot)[which(names(coef(full_boot)) == predictor)]
+  }
+  #p-value
+  pval <- 2 * min(
+  mean(results$coef_pred <= 0, na.rm = TRUE),
+  mean(results$coef_pred >= 0, na.rm = TRUE)
+)
+  # Output
+  cat("==================================================\n")
+  cat("Full Model Summary:\n")
+  print(summary(model2))
+  cat("\n==================================================\n")
+  cat("ANOVA: Covariates vs Full Model\n")
+  print(anova(model1, model2))
+  cat("\n==================================================\n")
+  cat("Bootstrapping Results (", n_iter, " iterations):\n", sep = "")
+  cat("Mean R² Difference: ", mean(results$r2_diff), "\n")
+  cat("Mean Adjusted R² Difference: ", mean(results$adjr2_diff), "\n")
+  cat("Mean Coefficient for ", predictor, ": ", mean(results$coef_pred), "\n", sep = "")
+  cat("95% CI for Coefficient: [", 
+      quantile(results$coef_pred, 0.025), ", ",
+      quantile(results$coef_pred, 0.975), "]\n", sep = "")
+  cat("p-value (coef <= 0): ", pval, "\n")
+}
+
+
+covars <- c("ICV", "mom_education")
+```
+
+#Get summaries for the first step of the HLR model for the table:
+
+#Left VTA-Hippocampus
+```{r, message=FALSE, warning=FALSE}
+ vars <- c("l_vta_hipp_count.log", covars)
+df_clean <- na.omit(df[ , vars])
+base_formula <- as.formula(paste("l_vta_hipp_count.log", "~", paste(covars, collapse = " + ")))
+model1 <- lm(base_formula, data = df_clean)
+summary(model1)
+confint(model1)
+```
+
+#Right VTA-Hippocampus
+```{r, message=FALSE, warning=FALSE}
+vars <- c("r_vta_hipp_count.log", covars)
+df_clean <- na.omit(df[ , vars])
+base_formula <- as.formula(paste("r_vta_hipp_count.log", "~", paste(covars, collapse = " + ")))
+model1 <- lm(base_formula, data = df_clean)
+summary(model1)
+confint(model1)
+```
+
+#Left VTA-Limbic
+```{r, message=FALSE, warning=FALSE}
+vars <- c("l_vta_limbic_count.log", covars)
+df_clean <- na.omit(df[ , vars])
+base_formula <- as.formula(paste("l_vta_limbic_count.log", "~", paste(covars, collapse = " + ")))
+model1 <- lm(base_formula, data = df_clean)
+summary(model1)
+confint(model1)
+```
+
+#Right VTA-Limbic
+```{r, message=FALSE, warning=FALSE}
+vars <- c("r_vta_limbic_count.log", covars)
+df_clean <- na.omit(df[ , vars])
+base_formula <- as.formula(paste("r_vta_limbic_count.log", "~", paste(covars, collapse = " + ")))
+model1 <- lm(base_formula, data = df_clean)
+summary(model1)
+confint(model1)
+```
+
+#Macrostructural HLR Models - PNMI and Streamline Density
+
+#Left VTA-Hippocampus
+```{r, message=FALSE, warning=FALSE}
+T1.IL1RA.lvta_hipp <- hr(df, "l_vta_hipp_count.log", "IL1RA_1", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T1.IL8.lvta_hipp <- hr(df, "l_vta_hipp_count.log", "IL8_1", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T1.IL6.lvta_hipp <- hr(df, "l_vta_hipp_count.log", "IL6_1", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T1.STNFRII.lvta_hipp <- hr(df, "l_vta_hipp_count.log", "STNFRII_1", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T2.IL1RA.lvta_hipp <- hr(df, "l_vta_hipp_count.log", "IL1RA_2", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T2.IL8.lvta_hipp <- hr(df, "l_vta_hipp_count.log", "IL8_2", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T2.IL6.lvta_hipp <- hr(df, "l_vta_hipp_count.log", "IL6_2", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T2.STNFRII.lvta_hipp <- hr(df, "l_vta_hipp_count.log", "STNFRII_2", covars)
+```
+
+#Right VTA-Hippocampus
+```{r, message=FALSE, warning=FALSE}
+T1.IL1RA.rvta_hipp <- hr(df, "r_vta_hipp_count.log", "IL1RA_1", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T1.IL8.rvta_hipp <- hr(df, "r_vta_hipp_count.log", "IL8_1", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T1.IL6.rvta_hipp <- hr(df, "r_vta_hipp_count.log", "IL6_1", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T1.STNFRII.rvta_hipp <- hr(df, "r_vta_hipp_count.log", "STNFRII_1", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T2.IL1RA.rvta_hipp <- hr(df, "r_vta_hipp_count.log", "IL1RA_2", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T2.IL8.rvta_hipp <- hr(df, "r_vta_hipp_count.log", "IL8_2", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T2.IL6.rvta_hipp <- hr(df, "r_vta_hipp_count.log", "IL6_2", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T2.STNFRII.rvta_hipp <- hr(df, "r_vta_hipp_count.log", "STNFRII_2", covars)
+```
+
+#Left VTA-Limbic Striatum
+```{r, message=FALSE, warning=FALSE}
+T1.IL1RA.lvta_limbic <- hr(df, "l_vta_limbic_count.log", "IL1RA_1", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T1.IL8.lvta_limbic <- hr(df, "l_vta_limbic_count.log", "IL8_1", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T1.IL6.lvta_limbic <- hr(df, "l_vta_limbic_count.log", "IL6_1", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T1.STNFRII.lvta_limbic <- hr(df, "l_vta_limbic_count.log", "STNFRII_1", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T2.IL1RA.lvta_limbic <- hr(df, "l_vta_limbic_count.log", "IL1RA_2", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T2.IL8.lvta_limbic <- hr(df, "l_vta_limbic_count.log", "IL8_2", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T2.IL6.lvta_limbic <- hr(df, "l_vta_limbic_count.log", "IL6_2", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T2.STNFRII.lvta_limbic <- hr(df, "l_vta_limbic_count.log", "STNFRII_2", covars)
+```
+
+
+#Right VTA-Limbic Striatum
+
+```{r, message=FALSE, warning=FALSE}
+T1.IL1RA.rvta_limbic <- hr(df, "r_vta_limbic_count.log", "IL1RA_1", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T1.IL8.rvta_limbic <- hr(df, "r_vta_limbic_count.log", "IL8_1", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T1.IL6.rvta_limbic <- hr(df, "r_vta_limbic_count.log", "IL6_1", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T1.STNFRII.rvta_limbic <- hr(df, "r_vta_limbic_count.log", "STNFRII_1", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T2.IL1RA.rvta_limbic <- hr(df, "r_vta_limbic_count.log", "IL1RA_2", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T2.IL8.rvta_limbic <- hr(df, "r_vta_limbic_count.log", "IL8_2", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T2.IL6.rvta_limbic <- hr(df, "r_vta_limbic_count.log", "IL6_2", covars)
+```
+
+```{r, message=FALSE, warning=FALSE}
+T2.STNFRII.rvta_limbic <- hr(df, "r_vta_limbic_count.log", "STNFRII_2", covars)
+```
+
+
+
+#Make plots for significant models
+
+```{r, message=FALSE, warning=FALSE}
+
+Processed <- df
+
+# Fit multiple regression models for each dependent variable
+model_IL1RA_2 <- lm(IL1RA_2 ~ ICV + mom_education, data = Processed, na.action = na.exclude)
+model_STNFRII_1 <- lm(STNFRII_1 ~ ICV + mom_education, data = Processed, na.action = na.exclude)
+model_IL8_2 <- lm(IL8_2 ~ ICV + mom_education, data = Processed, na.action = na.exclude)
+model_l_vta_hipp <- lm(l_vta_hipp_count.log ~ ICV + mom_education, data = Processed, na.action = na.exclude)
+model_r_vta_hipp <- lm(r_vta_hipp_count.log ~ ICV + mom_education, data = Processed, na.action = na.exclude)
+model_l_vta_limbic <- lm(l_vta_limbic_count.log ~ ICV + mom_education, data = Processed, na.action = na.exclude)
+model_r_vta_limbic <- lm(r_vta_limbic_count.log ~ ICV + mom_education, data = Processed, na.action = na.exclude)
+
+# Extract residuals and store them in the dataset
+Processed$residuals_IL1RA_2 <- resid(model_IL1RA_2)
+Processed$residuals_STNFRII_1 <- resid(model_STNFRII_1)
+Processed$residuals_IL8_2 <- resid(model_IL8_2)
+Processed$residuals_l_vta_hipp <- resid(model_l_vta_hipp)
+Processed$residuals_r_vta_hipp <- resid(model_r_vta_hipp)
+Processed$residuals_l_vta_limbic <- resid(model_l_vta_limbic)
+Processed$residuals_r_vta_limbic <- resid(model_r_vta_limbic)
+
+# Load necessary libraries
+library(ggplot2)
+library(patchwork)  # For arranging multiple plots
+library(grid)
+
+# Rename columns in Processed dataset for clarity
+Processed <- Processed %>%
+rename(
+  `Trimester 2 IL-1ra` = residuals_IL1RA_2,
+  `Trimester 1 sTNF-RII` = residuals_STNFRII_1,
+  `Trimester 2 IL-8` = residuals_IL8_2,
+  `Left VTA-Hippocampus` = residuals_l_vta_hipp,
+  `Right VTA-Hippocampus` = residuals_r_vta_hipp,
+  `Left VTA-Limbic Striatum` = residuals_l_vta_limbic,
+  `Right VTA-Limbic Striatum` = residuals_r_vta_limbic,
+ )
+
+# Create scatter plots with regression lines and no title
+
+p1 <- ggplot(Processed, aes(x = `Trimester 2 IL-1ra`, y = `Left VTA-Hippocampus`)) +
+geom_point() +
+geom_smooth(method = "lm", se = FALSE, color = "blue") +
+labs(y = "Left VTA–Hippocampus") +
+theme_bw() +
+theme(
+  axis.text = element_text(size = 12),
+  axis.title = element_text(size = 14, face = "bold")
+)
+
+p2 <- ggplot(Processed, aes(x = `Trimester 1 sTNF-RII`, y = `Right VTA-Hippocampus`)) +
+geom_point() +
+geom_smooth(method = "lm", se = FALSE, color = "blue") +
+labs(y = "Right VTA–Hippocampus") +
+theme_bw() +
+theme(
+  axis.text = element_text(size = 12),
+  axis.title = element_text(size = 14, face = "bold")
+)
+
+p3 <- ggplot(Processed, aes(x = `Trimester 2 IL-8`, y = `Left VTA-Limbic Striatum`)) +
+geom_point() +
+geom_smooth(method = "lm", se = FALSE, color = "blue") +
+labs(y = "Left VTA–Limbic Striatum") +
+theme_bw() +
+theme(
+  axis.text = element_text(size = 12),
+  axis.title = element_text(size = 14, face = "bold")
+)
+
+p4 <- ggplot(Processed, aes(x = `Trimester 2 IL-8`, y = `Right VTA-Limbic Striatum`)) +
+geom_point() +
+geom_smooth(method = "lm", se = FALSE, color = "blue") +
+labs(y = "Right VTA–Limbic Striatum") +
+theme_bw() +
+theme(
+  axis.text = element_text(size = 12),
+  axis.title = element_text(size = 14, face = "bold")
+)
+
+p5 <- ggplot(Processed, aes(x = `Trimester 1 sTNF-RII`, y = `Right VTA-Limbic Striatum`)) +
+geom_point() +
+geom_smooth(method = "lm", se = FALSE, color = "blue") +
+labs(y = "Right VTA–Limbic Striatum") +
+theme_bw() +
+theme(
+  axis.text = element_text(size = 12),
+  axis.title = element_text(size = 14, face = "bold")
+)
+
+p1
+p2
+p3
+p4
+p5
+```
